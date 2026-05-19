@@ -1,60 +1,96 @@
-import helper
-import trader
-import time
+"""
+Application.py — tAPIbot entry point
+Listens for arbitrage signals from Tanulytics and executes them.
+"""
+import json
+import logging
+import os
+import sys
+from pathlib import Path
 
-# TODO: complete re-write/refactor. Seriously.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / "config" / ".env")
+except ImportError:
+    pass
 
-# print a comforting startup message for impatient users
-print'Greetings, human. tAPI-bot loading...'
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+)
+log = logging.getLogger("tAPIbot")
 
-# Fire up the magic
-trader = trader.trade()
-config = trader.config
-log = trader.log
-log.info('tAPI-bot Starting')
-# printing needs instantiated classes
-printing = helper.Printing(log, config, trader)
+from trader import ArbTrader
 
-
-def printConfig():
-    """Output basic configured info as reminder to user"""
-    # Why not log instead? Are we asking user to confirm settings?
-    pass  # until implemented
+MODE = os.getenv("MODE", "listen").lower()   # listen | dry-run
 
 
-def runLoop(times=1, inf=True):
-    """Main loop, refresh, display, and trade"""
-    while times > 0:
-        # check volatility before attempting to trade
-        # TODO: move to trader
-        volatility = trader.check_volatility()
-        min_volatility = config.min_volatility
-        print('Volatility is %.2f' % volatility) + '%'
-        if volatility >= min_volatility:
-            trader.update()
-            if config.verbose:
-                printing.displayBalance()
-            if config.showTicker:
-                printing.displayTicker()
-            last = trader.last
-            log.info('Last Price: %s' % (last))
-            print('Last Price: %s' % (last))
-            printing.separator()
-            # dirty, dirty loop
-            if not inf:
-                times -= 1
-            if times >= 1:
-                for second in range(config.sleepTime):
-                    time.sleep(1)
-        else:
-            v_sleep = config.volatility_sleep
-            print('Volatility below threshold.')
-            print('Sleeping for %s seconds.' % v_sleep)
-            for second in range(v_sleep):
-                time.sleep(1)
+def run_dry():
+    """Execute a synthetic signal to verify the pipeline end-to-end."""
+    log.info("Dry-run mode: sending test signal to ArbTrader")
+    trader = ArbTrader()
+    test_signal = {
+        "profit":              12.50,
+        "volume":              0.005,
+        "buy_exchange":        "KrakenUSD",
+        "sell_exchange":       "BitstampUSD",
+        "buy_price":           67800.00,
+        "sell_price":          67925.00,
+        "weighted_buy_price":  67812.50,
+        "weighted_sell_price": 67918.75,
+        "profit_pct":          0.1543,
+    }
+    result = trader.execute(test_signal)
+    log.info(f"Dry-run result: {json.dumps(result, indent=2)}")
 
-# TODO: read version from file
-print'tAPI-bot v0.52 ready.'
-runLoop()
 
-# python is pretty awesome
+def run_listen():
+    """
+    Poll for new signals written to the Tanulytics signal log by the
+    crypto_arb_fetch.py pipeline and execute each one.
+
+    In a production setup, replace the polling loop with a lightweight
+    Flask endpoint (similar to tv_webhook_server.py) so signals are
+    processed in real time rather than on a file-poll interval.
+    """
+    from pathlib import Path
+    import time
+
+    signal_log = Path(os.getenv(
+        "SIGNAL_LOG",
+        str(Path(__file__).parent.parent / "data" / "arb_signals.jsonl"),
+    ))
+    poll_secs  = int(os.getenv("POLL_INTERVAL_SECONDS", "10"))
+    trader     = ArbTrader()
+    seen_lines = 0
+
+    log.info(f"tAPIbot listening for signals (poll every {poll_secs}s)")
+    log.info(f"Signal log: {signal_log}")
+    log.info(f"Exchange:   {trader.trade.ex.id}  readonly={trader.readonly}")
+
+    while True:
+        if signal_log.exists():
+            with signal_log.open() as f:
+                lines = f.readlines()
+            new_lines = lines[seen_lines:]
+            for line in new_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry  = json.loads(line)
+                    signal = entry.get("signal", entry)
+                    result = trader.execute(signal)
+                    log.info(f"Executed: {result}")
+                except (json.JSONDecodeError, Exception) as e:
+                    log.error(f"Failed to process signal line: {e}")
+            seen_lines = len(lines)
+        time.sleep(poll_secs)
+
+
+if __name__ == "__main__":
+    log.info("tAPIbot starting — africaxt/tAPIbot (Binance + Kraken via ccxt)")
+    if MODE == "dry-run":
+        run_dry()
+    else:
+        run_listen()
